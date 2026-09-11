@@ -1,0 +1,472 @@
+---
+description: Lumibot engine guidance — Strategy class, broker setup, backtesting, and recipes for this strategy
+alwaysApply: true
+---
+
+# Lumibot on TradingHost
+
+You are helping a user build a trading bot using Lumibot. This file covers Lumibot-specific knowledge — the Strategy class, broker setup, backtesting, and recipes. See `tradinghost.mdc` for platform conventions (deployment, env vars, logging, persistence, config).
+
+## Engine Overview
+
+Lumibot is a beginner-friendly Python trading framework built by LumiWealth. It wraps multiple brokers (Alpaca, Interactive Brokers, Tradier) into a unified interface so you write strategy logic once and switch brokers with a config change.
+
+Key capabilities:
+- Strategy class with `on_trading_iteration()` called on a configurable schedule
+- Built-in backtesting with Yahoo Finance data — test ideas before risking real money
+- Unified broker abstraction — `self.create_order()`, `self.get_positions()`, `self.get_portfolio_value()` work the same across all brokers
+- Position sizing helpers — `self.get_cash()`, `self.get_portfolio_value()`, `self.get_positions()`
+- Order types: market, limit, stop, bracket orders, trailing stops
+- Options support (via Interactive Brokers)
+- Multiple strategies can run in one `Trader` instance
+- Automatic order lifecycle management — submit, track, cancel
+
+Limitations:
+- Crypto support is limited — CCXT is better for crypto exchanges
+- No native WebSocket streaming — Lumibot polls on a schedule
+- The `Trader.run_all()` call is blocking — the main thread is owned by Lumibot
+- Backtesting uses daily Yahoo Finance data by default — intraday backtesting requires a data source subscription
+- Strategies are class-based only — no decorator or functional API
+
+## Broker Setup
+
+Broker credentials are read from **environment variables** (TradingHost strategy secrets), never from `config.json`. Use names like `ALPACA_API_KEY` / `ALPACA_API_SECRET` or `TRADIER_ACCESS_TOKEN` / `TRADIER_ACCOUNT_NUMBER`. Non-secret tunables (the `paper` flag, IB host/port/client id, symbols) belong in `config.json`. See `tradinghost.mdc` → "Secrets & Credentials".
+
+The shipped `requirements.txt` covers the Alpaca path (`lumibot`, `alpaca-py`). If you switch broker, add that broker's dependency to `requirements.txt` — Interactive Brokers needs `ib_insync` (and an external IB Gateway, see the Interactive Brokers template), Tradier works through Lumibot's bundled HTTP client. Redeploy after changing dependencies.
+
+### Alpaca (recommended for beginners)
+
+Alpaca offers free paper trading with no account minimum — the easiest way to start.
+
+1. Create an account at https://app.alpaca.markets/signup
+2. Go to https://app.alpaca.markets/paper/dashboard/overview
+3. Click "API Keys" in the sidebar → "Generate New Keys"
+4. Copy the API Key and Secret Key (secret shown only once)
+5. For live trading: switch to the Live dashboard and generate separate live keys
+6. Paper trading URL: `https://paper-api.alpaca.markets` (Lumibot handles this via the `PAPER` flag)
+
+```python
+import json, os
+
+DATA_DIR = os.environ.get('TRADINGHOST_DATA_DIR', '/data')
+with open(os.path.join(DATA_DIR, 'config.json')) as f:
+    config = json.load(f)
+
+import os
+from lumibot.brokers import Alpaca
+
+ALPACA_CONFIG = {
+    'API_KEY': os.environ['ALPACA_API_KEY'],
+    'API_SECRET': os.environ['ALPACA_API_SECRET'],
+    'PAPER': config.get('paper', True),
+}
+
+broker = Alpaca(ALPACA_CONFIG)
+```
+
+### Interactive Brokers (advanced)
+
+IB offers stocks, options, futures, and forex. Requires IB Gateway or TWS running (on TradingHost, use a port to expose the IB Gateway API or run it in the same container).
+
+```python
+from lumibot.brokers import InteractiveBrokers
+
+INTERACTIVE_BROKERS_CONFIG = {
+    'SOCKET_PORT': 7497,       # 7497 for paper, 7496 for live
+    'CLIENT_ID': 'tradinghost',
+    'IP': '127.0.0.1',
+}
+
+broker = InteractiveBrokers(INTERACTIVE_BROKERS_CONFIG)
+```
+
+### Tradier
+
+Tradier offers commission-free stock and options trading.
+
+```python
+from lumibot.brokers import Tradier
+
+TRADIER_CONFIG = {
+    'ACCESS_TOKEN': os.environ['TRADIER_ACCESS_TOKEN'],
+    'ACCOUNT_NUMBER': os.environ['TRADIER_ACCOUNT_NUMBER'],
+    'PAPER': config.get('paper', True),
+}
+
+broker = Tradier(TRADIER_CONFIG)
+```
+
+## Entry Point
+
+Lumibot's `Trader.run_all()` is a blocking call that owns the main thread. The entry point must handle SIGTERM by calling `trader.stop()` — Lumibot does not handle it natively.
+
+```python
+import json, os, signal
+from lumibot.brokers import Alpaca
+from lumibot.traders import Trader
+from strategy import MyStrategy
+
+DATA_DIR = os.environ.get('TRADINGHOST_DATA_DIR', '/data')
+
+with open(os.path.join(DATA_DIR, 'config.json')) as f:
+    config = json.load(f)
+
+broker = Alpaca({
+    'API_KEY': os.environ['ALPACA_API_KEY'],
+    'API_SECRET': os.environ['ALPACA_API_SECRET'],
+    'PAPER': config.get('paper', True),
+})
+strategy = MyStrategy(broker=broker)
+
+trader = Trader()
+trader.add_strategy(strategy)
+
+def shutdown(sig, frame):
+    trader.stop()
+
+signal.signal(signal.SIGTERM, shutdown)
+signal.signal(signal.SIGINT, shutdown)
+
+trader.run_all()
+```
+
+### Capturing Lumibot Logs
+
+Lumibot uses Python's `logging` module internally. To capture its output as structured JSON in the TradingHost console:
+
+```python
+import logging, json
+
+class JsonHandler(logging.Handler):
+    def emit(self, record):
+        print(json.dumps({
+            'level': record.levelname.lower(),
+            'msg': record.getMessage(),
+            'logger': record.name,
+        }), flush=True)
+
+logging.getLogger('lumibot').addHandler(JsonHandler())
+logging.getLogger('lumibot').setLevel(logging.INFO)
+```
+
+## Suggestions
+
+### Backtest Before Deploying
+
+Suggest running backtests locally before deploying to TradingHost. This validates the strategy logic without risking money.
+
+```python
+from lumibot.backtesting import YahooDataBacktesting
+from datetime import datetime
+
+MyStrategy.backtest(
+    YahooDataBacktesting,
+    datetime(2023, 1, 1),
+    datetime(2024, 1, 1),
+    parameters={'symbol': 'SPY', 'lookback': 20},
+)
+```
+
+### Multiple Strategies
+
+Lumibot supports running multiple strategies in one Trader:
+
+```python
+strategy_a = MomentumStrategy(broker=broker, parameters={'lookback': 20})
+strategy_b = MeanReversionStrategy(broker=broker, parameters={'threshold': 2.0})
+
+trader = Trader()
+trader.add_strategy(strategy_a)
+trader.add_strategy(strategy_b)
+trader.run_all()
+```
+
+Each strategy gets its own `on_trading_iteration()` cycle. Be careful with position conflicts — two strategies should trade different symbols or coordinate via SQLite.
+
+## Recipes
+
+### Creating a Strategy Class
+
+Every Lumibot strategy extends `Strategy` and implements `on_trading_iteration()`:
+
+```python
+from lumibot.strategies import Strategy
+
+class MyStrategy(Strategy):
+    parameters = {
+        'symbol': 'SPY',
+        'quantity': 10,
+    }
+
+    def initialize(self):
+        self.sleeptime = '1D'  # Run once per day
+
+    def on_trading_iteration(self):
+        symbol = self.parameters['symbol']
+        quantity = self.parameters['quantity']
+
+        current_price = self.get_last_price(symbol)
+        log('info', 'Iteration', symbol=symbol, price=current_price)
+```
+
+`self.sleeptime` controls how often `on_trading_iteration()` runs. Values: `'1M'` (1 minute), `'5M'`, `'15M'`, `'1H'`, `'1D'`.
+
+### Implementing Momentum (Buy Top N)
+
+```python
+class MomentumStrategy(Strategy):
+    parameters = {
+        'symbols': ['AAPL', 'MSFT', 'GOOGL', 'AMZN', 'NVDA', 'META', 'TSLA', 'JPM', 'V', 'UNH'],
+        'top_n': 3,
+        'lookback_days': 30,
+    }
+
+    def initialize(self):
+        self.sleeptime = '1D'
+
+    def on_trading_iteration(self):
+        symbols = self.parameters['symbols']
+        top_n = self.parameters['top_n']
+
+        returns = {}
+        for symbol in symbols:
+            bars = self.get_historical_prices(symbol, self.parameters['lookback_days'], 'day')
+            if bars and len(bars.df) >= 2:
+                pct = (bars.df['close'].iloc[-1] / bars.df['close'].iloc[0]) - 1
+                returns[symbol] = pct
+
+        winners = sorted(returns, key=returns.get, reverse=True)[:top_n]
+
+        current_positions = {p.symbol: p for p in self.get_positions()}
+        for symbol, pos in current_positions.items():
+            if symbol not in winners:
+                self.sell_all(symbol)
+
+        cash = self.get_cash()
+        per_stock = cash / max(len(winners), 1)
+        for symbol in winners:
+            if symbol not in current_positions:
+                price = self.get_last_price(symbol)
+                if price and price > 0:
+                    qty = int(per_stock / price)
+                    if qty > 0:
+                        order = self.create_order(symbol, qty, 'buy')
+                        self.submit_order(order)
+```
+
+### Implementing Mean Reversion
+
+```python
+class MeanReversionStrategy(Strategy):
+    parameters = {
+        'symbol': 'SPY',
+        'lookback': 20,
+        'entry_std': 2.0,
+        'exit_std': 0.5,
+        'max_pct_portfolio': 0.25,
+    }
+
+    def initialize(self):
+        self.sleeptime = '1D'
+
+    def on_trading_iteration(self):
+        symbol = self.parameters['symbol']
+        bars = self.get_historical_prices(symbol, self.parameters['lookback'] + 5, 'day')
+        if not bars or len(bars.df) < self.parameters['lookback']:
+            return
+
+        closes = bars.df['close'].tail(self.parameters['lookback'])
+        mean = closes.mean()
+        std = closes.std()
+        current_price = self.get_last_price(symbol)
+        z_score = (current_price - mean) / std if std > 0 else 0
+
+        position = self.get_position(symbol)
+
+        if z_score < -self.parameters['entry_std'] and not position:
+            cash = self.get_cash()
+            max_spend = self.get_portfolio_value() * self.parameters['max_pct_portfolio']
+            spend = min(cash, max_spend)
+            qty = int(spend / current_price)
+            if qty > 0:
+                order = self.create_order(symbol, qty, 'buy')
+                self.submit_order(order)
+
+        elif position and z_score > -self.parameters['exit_std']:
+            self.sell_all(symbol)
+```
+
+### Adding a Custom Indicator
+
+Use pandas for technical indicators. Lumibot's `get_historical_prices()` returns a `Bars` object with a `.df` DataFrame:
+
+```python
+def calculate_rsi(self, symbol, period=14):
+    bars = self.get_historical_prices(symbol, period + 10, 'day')
+    if not bars or len(bars.df) < period:
+        return None
+    delta = bars.df['close'].diff()
+    gain = delta.where(delta > 0, 0).rolling(window=period).mean()
+    loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
+    rs = gain / loss
+    rsi = 100 - (100 / (1 + rs))
+    return rsi.iloc[-1]
+```
+
+### Running a Backtest
+
+```python
+from lumibot.backtesting import YahooDataBacktesting
+from datetime import datetime
+
+if __name__ == '__main__':
+    results = MyStrategy.backtest(
+        YahooDataBacktesting,
+        datetime(2022, 1, 1),
+        datetime(2024, 12, 31),
+        parameters={'symbol': 'SPY', 'lookback': 20},
+        benchmark_asset='SPY',
+    )
+    # results contains stats: total return, sharpe, max drawdown, etc.
+```
+
+Run backtests locally (not on TradingHost) — they don't need broker credentials.
+
+### Switching from Paper to Live
+
+1. In `config.json`, set `"paper": false`
+2. Update the `ALPACA_API_KEY` / `ALPACA_API_SECRET` strategy secrets with live keys
+3. For Alpaca: generate live keys from the "Live Trading" tab at https://app.alpaca.markets
+4. Redeploy on TradingHost — the strategy restarts with live credentials (a redeploy is required for new secrets to take effect)
+5. Monitor closely for the first few trading sessions
+
+### Adding Position Sizing Logic
+
+```python
+def size_position(self, symbol, risk_pct=0.02):
+    portfolio_value = self.get_portfolio_value()
+    risk_amount = portfolio_value * risk_pct
+    price = self.get_last_price(symbol)
+    if not price or price <= 0:
+        return 0
+    return int(risk_amount / price)
+```
+
+### Schedule Rebalancing
+
+Use `self.sleeptime` to control frequency, and add a day-of-week check for weekly rebalancing:
+
+```python
+from datetime import datetime
+
+def on_trading_iteration(self):
+    now = datetime.now()
+    if now.weekday() != 0:  # Only rebalance on Mondays
+        return
+    self.rebalance()
+```
+
+### Get Portfolio Value Over Time
+
+Log portfolio snapshots to SQLite for charting on the web panel:
+
+```python
+def on_trading_iteration(self):
+    value = self.get_portfolio_value()
+    cash = self.get_cash()
+    db.execute('INSERT INTO snapshots (timestamp, value, cash) VALUES (?, ?, ?)',
+               (int(time.time()), value, cash))
+    db.commit()
+```
+
+### Sell All Positions
+
+```python
+def liquidate_all(self):
+    for position in self.get_positions():
+        self.sell_all(position.symbol)
+```
+
+## Risk Management
+
+Always advise the user on risk:
+- Use `self.get_portfolio_value()` to calculate position sizes as a percentage of total capital — never hardcode dollar amounts
+- Use `self.get_cash()` to avoid over-leveraging — don't buy if you can't afford it
+- Set a max number of positions (`max_positions` parameter) to limit concentration risk
+- Track drawdown: compare current portfolio value against a high-water mark stored in SQLite. If drawdown exceeds a threshold, stop trading
+- Start with `paper: true` — switch to live only after confirming correct behavior over multiple trading sessions
+- Use limit orders when possible — market orders can slip, especially in low-volume stocks
+- Set a daily loss limit — if the strategy loses more than X% in a day, call `self.sell_all()` for all positions and skip remaining iterations
+- Account for market hours — Alpaca paper trading simulates real market hours. Don't expect fills on weekends
+- For live trading: start with small position sizes (1-2% of portfolio per trade) and scale up gradually
+
+### Drawdown Monitor Pattern
+
+```python
+def initialize(self):
+    self.high_water_mark = self.get_portfolio_value()
+    self.max_drawdown_pct = 0.10
+
+def on_trading_iteration(self):
+    value = self.get_portfolio_value()
+    self.high_water_mark = max(self.high_water_mark, value)
+    drawdown = (self.high_water_mark - value) / self.high_water_mark
+
+    if drawdown > self.max_drawdown_pct:
+        log('warn', 'Max drawdown exceeded — liquidating', drawdown=f'{drawdown:.2%}')
+        for pos in self.get_positions():
+            self.sell_all(pos.symbol)
+        return
+```
+
+## Testing
+
+### Paper Trading Workflow
+
+1. Set `paper: true` in `config.json` (this is the default)
+2. Deploy to TradingHost
+3. Monitor in the deployment console — check that:
+   - Strategy connects to Alpaca successfully
+   - `on_trading_iteration()` runs on schedule
+   - Orders are placed and filled
+   - Positions are tracked correctly
+4. Let it run for at least a few trading days before considering live
+
+### Built-in Backtesting
+
+Lumibot includes a backtesting engine that uses Yahoo Finance data (free, no API key needed):
+
+```python
+from lumibot.backtesting import YahooDataBacktesting
+from datetime import datetime
+
+MyStrategy.backtest(
+    YahooDataBacktesting,
+    datetime(2023, 1, 1),
+    datetime(2024, 6, 1),
+    parameters={'symbol': 'SPY'},
+    benchmark_asset='SPY',
+)
+```
+
+Backtests run locally on your machine — they don't need TradingHost or a broker connection. Use them to validate strategy logic before deploying.
+
+### What to Verify Before Going Live
+
+- Strategy starts cleanly after a restart (no duplicate orders, no stale state)
+- SIGTERM produces clean shutdown (`trader.stop()` is called)
+- Lumibot connects to the broker without errors
+- `on_trading_iteration()` runs at the expected frequency
+- Orders execute correctly (check filled quantity and price)
+- Position sizing stays within configured limits
+- Drawdown monitoring triggers correctly
+- Web panel (if built) shows accurate portfolio state
+- SQLite analytics data matches broker account state
+- Paper trading results are reasonable over multiple sessions
+
+### Testing Tips
+
+- Use `self.sleeptime = '1M'` during testing for faster iteration cycles
+- Check Alpaca's dashboard (https://app.alpaca.markets) to verify orders match what the bot reports
+- Compare Lumibot's `self.get_portfolio_value()` against Alpaca's dashboard value
+- Test a restart mid-session: stop and restart the deployment, verify no duplicate orders are placed

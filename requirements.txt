@@ -1,0 +1,2 @@
+lumibot>=3.5.0
+alpaca-py>=0.30.0
